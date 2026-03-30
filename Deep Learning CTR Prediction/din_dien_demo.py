@@ -1,8 +1,9 @@
 """
-DIN & DIEN 模型实现 (PyTorch)
-=============================
+DIN & DIEN & BST 模型实现 (PyTorch)
+=====================================
 DIN:  Deep Interest Network (Alibaba, 2018)
 DIEN: Deep Interest Evolution Network (Alibaba, 2019)
+BST:  Behavior Sequence Transformer (Alibaba, 2019)
 
 包含: 模型定义、模拟数据生成、训练、推理
 """
@@ -341,6 +342,135 @@ class DIEN(nn.Module):
 
 
 # ============================================================
+# BST 模型 (Behavior Sequence Transformer)
+# ============================================================
+
+class TransformerBlock(nn.Module):
+    """标准 Transformer Block: Multi-Head Attention + FFN + LayerNorm + Residual"""
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model),
+            nn.Dropout(dropout),
+        )
+        self.ln1 = nn.LayerNorm(d_model)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None):
+        # Multi-Head Self-Attention + Residual + LayerNorm
+        attn_out, _ = self.attn(x, x, x, key_padding_mask=key_padding_mask)
+        x = self.ln1(x + self.dropout(attn_out))
+        # Feed-Forward + Residual + LayerNorm
+        x = self.ln2(x + self.ffn(x))
+        return x
+
+
+class BST(nn.Module):
+    """Behavior Sequence Transformer
+
+    核心思想: 用 Transformer 替代 GRU 建模行为序列
+    结构:
+      行为序列 + 候选商品 → Embedding + Position Encoding
+      → Transformer Block × L 层 (Self-Attention 捕捉行为间交互)
+      → 取候选商品位置的输出作为兴趣表示
+      → 拼接其他特征 → MLP → CTR
+
+    关键设计:
+      1. 候选商品拼接到行为序列末尾, 通过Self-Attention与所有历史行为直接交互
+      2. 可学习的位置编码 (Learnable Position Encoding)
+      3. 只需1-2层Transformer (行为序列远短于NLP文本)
+    """
+    def __init__(
+        self,
+        num_items: int,
+        num_cats: int,
+        embed_dim: int = 16,
+        max_seq_len: int = 30,
+        n_layers: int = 2,
+        n_heads: int = 4,
+        dropout: float = 0.1,
+        mlp_dims: list = None,
+    ):
+        super().__init__()
+        if mlp_dims is None:
+            mlp_dims = [128, 64]
+
+        self.item_emb = nn.Embedding(num_items, embed_dim, padding_idx=0)
+        self.cat_emb = nn.Embedding(num_cats, embed_dim, padding_idx=0)
+
+        behavior_dim = 2 * embed_dim  # item + cat 拼接
+        # +1 是因为候选商品也加入序列末尾
+        self.pos_emb = nn.Embedding(max_seq_len + 1, behavior_dim)
+
+        # Transformer 层 (论文中只用1-2层)
+        d_ff = behavior_dim * 4
+        self.transformer_blocks = nn.ModuleList([
+            TransformerBlock(behavior_dim, n_heads, d_ff, dropout)
+            for _ in range(n_layers)
+        ])
+        self.dropout = nn.Dropout(dropout)
+
+        # MLP: Transformer输出(behavior_dim) + 候选广告(behavior_dim)
+        mlp_input_dim = behavior_dim * 2
+        layers = []
+        for dim in mlp_dims:
+            layers.extend([nn.Linear(mlp_input_dim, dim), Dice(dim)])
+            mlp_input_dim = dim
+        layers.append(nn.Linear(mlp_input_dim, 1))
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(
+        self,
+        hist_item_ids: torch.Tensor,   # (B, T)
+        hist_cat_ids: torch.Tensor,    # (B, T)
+        cand_item_id: torch.Tensor,    # (B,)
+        cand_cat_id: torch.Tensor,     # (B,)
+    ) -> torch.Tensor:
+        B, T = hist_item_ids.shape
+
+        # ---- Embedding ----
+        hist_emb = torch.cat([
+            self.item_emb(hist_item_ids),
+            self.cat_emb(hist_cat_ids),
+        ], dim=-1)  # (B, T, 2E)
+        cand_emb = torch.cat([
+            self.item_emb(cand_item_id),
+            self.cat_emb(cand_cat_id),
+        ], dim=-1)  # (B, 2E)
+
+        # 候选商品拼接到序列末尾: [b1, b2, ..., bT, target]
+        seq = torch.cat([hist_emb, cand_emb.unsqueeze(1)], dim=1)  # (B, T+1, 2E)
+
+        # ---- Position Encoding (可学习) ----
+        positions = torch.arange(T + 1, device=seq.device).unsqueeze(0).expand(B, -1)
+        seq = seq + self.pos_emb(positions)
+        seq = self.dropout(seq)
+
+        # ---- Padding Mask ----
+        # hist padding位 + 候选位(始终有效) → (B, T+1), True=需要mask
+        hist_mask = hist_item_ids == 0  # (B, T)
+        cand_mask = torch.zeros(B, 1, dtype=torch.bool, device=seq.device)
+        padding_mask = torch.cat([hist_mask, cand_mask], dim=1)  # (B, T+1)
+
+        # ---- Transformer Blocks ----
+        for block in self.transformer_blocks:
+            seq = block(seq, key_padding_mask=padding_mask)
+
+        # ---- 取候选商品位置的输出 (最后一个位置) ----
+        target_output = seq[:, -1, :]  # (B, 2E)
+
+        # ---- MLP ----
+        concat = torch.cat([target_output, cand_emb], dim=-1)
+        logit = self.mlp(concat).squeeze(-1)
+        return logit
+
+
+# ============================================================
 # 模拟数据集
 # ============================================================
 
@@ -602,10 +732,17 @@ def main():
     dien = train_model(dien, train_loader, val_loader, model_name="DIEN", epochs=EPOCHS, lr=LR)
     inference_demo(dien, val_ds, "DIEN", is_dien=True)
 
+    # ---- BST ----
+    bst = BST(num_items=NUM_ITEMS, num_cats=NUM_CATS, embed_dim=EMBED_DIM,
+              max_seq_len=MAX_SEQ_LEN, n_layers=2, n_heads=4)
+    bst = train_model(bst, train_loader, val_loader, model_name="BST", epochs=EPOCHS, lr=LR)
+    inference_demo(bst, val_ds, "BST", is_dien=False)
+
     # ---- 保存模型 ----
     torch.save(din.state_dict(), '/tmp/din_model.pt')
     torch.save(dien.state_dict(), '/tmp/dien_model.pt')
-    print(f"\n模型已保存到 /tmp/din_model.pt 和 /tmp/dien_model.pt")
+    torch.save(bst.state_dict(), '/tmp/bst_model.pt')
+    print(f"\n模型已保存到 /tmp/din_model.pt, /tmp/dien_model.pt, /tmp/bst_model.pt")
 
 
 if __name__ == '__main__':
